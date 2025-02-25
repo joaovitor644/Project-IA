@@ -1,45 +1,35 @@
+import ale_py.env
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import DQN
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 import torch
 import ale_py
-import copy  # para fallback no clone do ambiente
+import copy
+import random
 
-# Configurações
-N_EPISODES = 1000          # Número de partidas para avaliar
-WINNING_SCORE = 7        # Pontos para encerrar o episódio
-MCTS_ITERATIONS = 1     # Número de iterações para o MCTS
 
-# Cria o ambiente sem renderização
-def create_env():
-    env = gym.make("ALE/Pong-v5", render_mode=None)  # Sem janela gráfica
+gym.register_envs(ale_py)
+
+# Configuração
+N_COMPARACOES = 100  # Número de partidas que cada agente ira jogar.
+PONTUACAO_MAX = 7  # Define o tamanho dos episodios.
+
+# Criar ambiente
+def create_env(render_mode=None):
+    env = gym.make("ALE/Pong-v5", render_mode=render_mode)
     return AtariWrapper(env)
 
-# Função para clonar o ambiente a partir do estado atual
-def clone_env(env):
-    """
-    Tenta clonar o estado do ambiente.
-    Presume que o ambiente suporta 'clone_full_state' e 'restore_full_state'.
-    Caso contrário, tenta usar copy.deepcopy (pode não funcionar para todos os casos).
-    """
-    env_clone = create_env()
-    try:
-        state = env.unwrapped.clone_full_state()
-        env_clone.unwrapped.restore_full_state(state)
-    except AttributeError:
-        env_clone = copy.deepcopy(env)
-    return env_clone
-
 # Carregar os modelos treinados
-dqn_agent_puro = DQN.load("dqn_pong_2M")    # Agente DQN puro (2M passos)
-dqn_agent_mcts = DQN.load("dqn_pong_1M")      # Agente DQN + MCTS (1M passos)
+# Use nomes diferentes para os modelos a serem comparados.
+dqn_agent_puro = DQN.load("data/dqn_pong_2M")          # Agente DQN puro
+dqn_agent_mcts = DQN.load("data/dqn_pong_1M")       # Agente DQN + MCTS
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Função para pegar ação do DQN (retorna ação)
 def get_dqn_action(model, obs):
-    # Garante que a observação esteja no formato [batch_size, canais, altura, largura]
+    # Garante que a observação esteja no formato [batch_size, channels, height, width]
     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 3, 1, 2)
     with torch.no_grad():
         q_values = model.policy.q_net(obs_tensor)
@@ -54,134 +44,146 @@ def get_q_values(model, obs):
 
 # Implementação simples do MCTS
 class MCTSNode:
-    def __init__(self, state, parent=None):
-        self.state = state
+    def __init__(self, state, parent=None, action=None):
+        self.state = copy.deepcopy(state)
         self.parent = parent
-        self.children = {}
+        self.action = action
+        self.children: list[MCTSNode] = []
         self.visits = 0
-        self.q_value = 0
+        self.value = 0
 
-    def expand(self, actions):
-        for action in actions:
-            if action not in self.children:
-                self.children[action] = MCTSNode(state=None, parent=self)
+    def is_fully_expanded(self, action_space):
+        return len(self.children) == action_space
 
-    def select(self, c=1.4):
-        # Seleciona a ação que maximiza o balanço entre exploração e exploração (fórmula UCB)
-        return max(
-            self.children.items(),
-            key=lambda item: item[1].q_value / (1 + item[1].visits) + 
-                           c * np.sqrt(np.log(self.visits + 1) / (1 + item[1].visits))
-        )[0]
+    def best_child(self, c_param=1.4):
+        choices_weights = [
+            (child.value / (child.visits + 1e-4)) + c_param * np.sqrt(np.log(self.visits + 1) / (child.visits + 1e-4))
+            for child in self.children
+        ]
+        return self.children[np.argmax(choices_weights)]
 
-    def update(self, reward):
-        self.visits += 1
-        self.q_value += reward
+def mcts(env: AtariWrapper, agent, simulations=1):
+    temp_env = create_env()
+    action_space = env.action_space.n
+    state = copy.deepcopy(env.unwrapped.clone_state())
+    root = MCTSNode(state=state)
 
-# Função para rodar MCTS + DQN a partir do estado atual
-def mcts(env, obs, model, iterations=MCTS_ITERATIONS):
-    root = MCTSNode(state=obs)
-    actions = list(range(env.action_space.n))
-    # Expande o nó raiz para garantir que ele tenha filhos
-    root.expand(actions)
-    
-    for _ in range(iterations):
+    for _ in range(simulations):
         node = root
-        # Clona o ambiente a partir do estado atual
-        temp_env = clone_env(env)
-        temp_obs = obs  # inicia com o estado atual
-        done = False
+        state = copy.deepcopy(root.state)
 
-        # Simula a trajetória a partir do estado atual
-        while node.children and not done:
-            action = node.select()
-            temp_obs, reward, done, truncated, _ = temp_env.step(action)
-            # Se a ação ainda não foi expandida a partir deste nó, expande-a
-            if action not in node.children:
-                node.expand(actions)
-            node = node.children[action]
+        # Seleção
+        while node.is_fully_expanded(temp_env.action_space.n):
+            node = node.best_child()
 
-        # Avalia o estado terminal ou não terminal utilizando os Q-values
-        if not done:
-            q_values = get_q_values(model, temp_obs)
+        # Expansão
+        if not node.is_fully_expanded(temp_env.action_space.n):
+            action = random.choice([a for a in range(temp_env.action_space.n) if a not in [child.action for child in node.children]])
+            temp_env.reset(seed=None, options={"state": state})
+            obs, reward, done, _, _ = temp_env.step(action)
+            new_state = obs
+            child_node = MCTSNode(new_state, node, action)
+            node.children.append(child_node)
+            node = child_node
+
+        # Simulaçao
+        total_reward = 0
+        rollout_length = 10
+        for _ in range(rollout_length):
+            q_values = get_q_values(agent, obs)
             best_q = np.max(q_values)
-        else:
-            best_q = 0
+            action = q_values.argmax().item()
+            # action = agent.select_action(new_state)
+            # obs, reward, done, _, _ = temp_env.step(action)
+            total_reward += best_q
+            if done:
+                break
+        
+        # Backpropagation
+        while node:
+            node.visits += 1
+            node.value += total_reward
+            node = node.parent
 
-        # Retropropaga o valor obtido na simulação
-        current = node
-        while current is not None:
-            current.update(best_q)
-            current = current.parent
+    return root.best_child(c_param=0)
 
-    # Seleciona a melhor ação a partir da raiz (sem fator de exploração)
-    best_action = root.select(c=0)
-    return best_action
 
-# Função para simular uma partida entre os dois agentes alternando as ações
+# Função para simular partidas entre os agentes e a maquina. um agente por episodio
 def play_agents():
     wins_mcts = 0
+    loss_mcts = 0
+    score_total_mcts = 0
     wins_puro = 0
-    placar = [0,0]
+    loss_puro = 0
+    score_total_puro = 0
 
-    for episode in range(N_EPISODES):
-        print(f"EPISÓDIO {episode+1}")
-        env = create_env()
+    env = create_env(render_mode=None) # pode setar o render_mode para "human" se quiser que renderize uma janela mostrando o jogo.
+    epNow = 0 # 0 = sem mcts, 1 = com mcts
+
+    for episode in range(N_COMPARACOES * 2):
+        print(f"EPISODIO {episode+1} {"(SEM MCTS)" if epNow == 0 else "(COM MCTS)"}")
         obs, _ = env.reset()
         done = False
+        step_count = 0
         score_mcts = 0
         score_puro = 0
-        step_count = 0
+        score_adversario = 0
 
-        # Alterna o controle entre os agentes a cada passo:
-        # Se step_count for par, o agente MCTS (DQN + MCTS) age;
-        # Se ímpar, o agente DQN puro age.
+        # joga com qualquer um dos agentes até algum dos jogadores ganhar a partida
         while not done:
-            if step_count % 2 == 0:
-                action = mcts(env, obs, dqn_agent_mcts)
+            if epNow != 0: 
+                action = mcts(env, dqn_agent_mcts).action 
                 acting_agent = "MCTS"
             else:
                 action = get_dqn_action(dqn_agent_puro, obs)
                 acting_agent = "Puro"
             obs, reward, done, truncated, _ = env.step(action)
+            
+            if(env.render_mode == "human"):
+                env.render()
 
-            # Interpretação simplificada: se o agente que agiu obteve recompensa positiva, ele marca ponto;
-            # se negativa, o outro agente marca.
+            # Interpretação simplificada: se o agente que agiu obteve recompensa positiva, ele marca ponto, caso contrario, o adversario marca ponto.
             if reward > 0:
                 if acting_agent == "MCTS":
                     score_mcts += 1
                 else:
                     score_puro += 1
             elif reward < 0:
-                if acting_agent == "MCTS":
-                    score_puro += 1
-                else:
-                    score_mcts += 1
-
-            # Encerra o episódio se algum agente atingir o placar definido
-            if score_mcts >= WINNING_SCORE or score_puro >= WINNING_SCORE:
-                done = True
+                score_adversario += 1   
 
             step_count += 1
 
-        if score_mcts > score_puro:
+            if score_mcts >= PONTUACAO_MAX or score_puro >= PONTUACAO_MAX or score_adversario >= PONTUACAO_MAX:
+                done = True
+
+        if score_mcts >= PONTUACAO_MAX:
             wins_mcts += 1
-        else:
+        elif score_puro >= PONTUACAO_MAX:
             wins_puro += 1
+        elif epNow == 1 and score_adversario > PONTUACAO_MAX:
+            loss_mcts += 1
+        elif epNow == 0 and score_adversario > PONTUACAO_MAX:
+            loss_puro += 1
 
-        print(f"Episódio {episode+1}: Score MCTS = {score_mcts}, Score Puro = {score_puro}")
-        if score_mcts > score_puro:
-            placar[0] += 1
+        score_total_mcts += score_mcts
+        score_total_puro += score_puro
+
+        print(f"Episódio {episode+1}: Score {'MCTS' if epNow == 1 else 'Puro'} = {score_mcts if epNow == 1 else score_puro}")
+        env.close()
+
+        if epNow == 1:
+            epNow = 0
         else:
-            placar[1] += 1
-        print(f"PLACAR: DQN_MCTS {placar[0]}x{placar[1]} DQN")
+            epNow = 1
 
-    win_rate_mcts = wins_mcts / N_EPISODES
-    win_rate_puro = wins_puro / N_EPISODES
+    win_rate_mcts = wins_mcts / (N_COMPARACOES)
+    win_rate_puro = wins_puro / (N_COMPARACOES)
 
     print(f"\nDQN (MCTS) -> Taxa de Vitórias: {win_rate_mcts * 100:.2f}%")
     print(f"DQN Puro    -> Taxa de Vitórias: {win_rate_puro * 100:.2f}%")
-    print(f"Placar final: DQN {int(win_rate_puro*N_EPISODES)} x {int(win_rate_mcts*N_EPISODES)} DQN_MCTS")
+
+    print(f"\nDQN (MCTS) -> Pontuação total: {score_total_mcts}")
+    print(f"DQN Puro    -> Pontuação total: {score_total_puro}")
 
 # Rodar a avaliação
 play_agents()
